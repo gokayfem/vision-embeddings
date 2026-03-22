@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import sys
+import types
 
 import torch
 from PIL import Image
@@ -21,6 +23,44 @@ _FULL_MODEL_TYPES: set[str] = {"clip", "siglip", "siglip2"}
 _VISION_ONLY_MAP: dict[str, str] = {
     "dinov2": "Dinov2Model",
 }
+
+
+def _ensure_flash_attn_importable() -> None:
+    """Install a no-op ``flash_attn`` shim so custom model files
+    (e.g. InternViT) can be imported even when flash_attn is absent.
+
+    The model will fall back to eager / sdpa attention at runtime.
+    """
+    try:
+        import flash_attn  # noqa: F401
+        return  # real package available, nothing to do
+    except ImportError:
+        pass
+
+    stub = types.ModuleType("flash_attn")
+    stub.__path__ = []  # type: ignore[attr-defined]
+
+    def _not_installed(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(
+            "flash_attn is not installed — model should use eager attention"
+        )
+
+    stub.flash_attn_func = _not_installed  # type: ignore[attr-defined]
+    stub.flash_attn_varlen_func = _not_installed  # type: ignore[attr-defined]
+    sys.modules["flash_attn"] = stub
+
+    iface = types.ModuleType("flash_attn.flash_attn_interface")
+    iface.flash_attn_func = _not_installed  # type: ignore[attr-defined]
+    iface.flash_attn_varlen_func = _not_installed  # type: ignore[attr-defined]
+    sys.modules["flash_attn.flash_attn_interface"] = iface
+
+    bert = types.ModuleType("flash_attn.bert_padding")
+    bert.pad_input = _not_installed  # type: ignore[attr-defined]
+    bert.unpad_input = _not_installed  # type: ignore[attr-defined]
+    bert.index_first_axis = _not_installed  # type: ignore[attr-defined]
+    sys.modules["flash_attn.bert_padding"] = bert
+
+    logger.info("Installed flash_attn stub — models will use eager attention")
 
 
 def _load_vision_model(model_id: str, dtype: torch.dtype) -> torch.nn.Module:
@@ -43,8 +83,9 @@ def _load_vision_model(model_id: str, dtype: torch.dtype) -> torch.nn.Module:
         return full.vision_model
 
     # Models with custom code (InternViT, DINOv3, etc.)
-    # Try eager attention first to avoid hard flash_attn dependency,
-    # then fall back to default if the model doesn't support attn_implementation.
+    # Ensure flash_attn is importable so custom modeling files don't crash.
+    _ensure_flash_attn_importable()
+
     try:
         full = AutoModel.from_pretrained(
             model_id, torch_dtype=dtype, trust_remote_code=True,

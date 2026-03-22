@@ -35,12 +35,13 @@ def _extract_hidden(x: Any) -> torch.Tensor:
 
 
 def _image_to_video(image: Image.Image, frames: int) -> torch.Tensor:
-    arr = np.asarray(image, dtype=np.uint8)
+    arr = np.array(image, dtype=np.uint8)
     return (
         torch.from_numpy(arr)
         .permute(2, 0, 1)
         .unsqueeze(0)
         .expand(frames, -1, -1, -1)
+        .contiguous()
     )
 
 

@@ -17,12 +17,13 @@ logger = logging.getLogger(__name__)
 
 def _image_to_video(image: Image.Image, frames: int) -> torch.Tensor:
     """PIL image -> ``T x C x H x W`` uint8 tensor (identical frames)."""
-    arr = np.asarray(image, dtype=np.uint8)
+    arr = np.array(image, dtype=np.uint8)  # np.array (not asarray) → writable copy
     return (
         torch.from_numpy(arr)
         .permute(2, 0, 1)
         .unsqueeze(0)
         .expand(frames, -1, -1, -1)
+        .contiguous()
     )
 
 
