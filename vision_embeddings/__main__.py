@@ -99,11 +99,11 @@ def main() -> None:
     print(f"Batch size: {batch_size}")
     print(f"Datasets  : {len(ds_names)}")
     print(f"Save mode : {args.save_mode}")
-    print(f"Upload    : {args.hf_org}/<encoder>--<dataset>\n")
+    print(f"Upload    : {args.hf_org}/<encoder>-<dataset>\n")
 
     for ds_name in ds_names:
         ds_config = get_dataset(ds_name)
-        repo_id = f"{args.hf_org}/{args.encoder}--{ds_name}"
+        repo_id = f"{args.hf_org}/{args.encoder}-{ds_name}"
         try:
             process_dataset(
                 encoder=encoder,
