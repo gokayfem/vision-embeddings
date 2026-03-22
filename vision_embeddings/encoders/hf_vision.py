@@ -94,6 +94,7 @@ def _load_vision_model(model_id: str, dtype: torch.dtype) -> torch.nn.Module:
         torch_dtype=dtype,
         trust_remote_code=True,
         device_map=None,
+        low_cpu_mem_usage=False,
     )
 
     return full.vision_model if hasattr(full, "vision_model") else full
