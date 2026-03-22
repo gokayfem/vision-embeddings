@@ -12,10 +12,13 @@ from .base import BaseEncoder
 
 logger = logging.getLogger(__name__)
 
-_VISION_CLASS_MAP: dict[str, str] = {
-    "siglip2": "Siglip2VisionModel",
-    "siglip": "SiglipVisionModel",
-    "clip": "CLIPVisionModel",
+# Model types where we load the full model and extract .vision_model
+# to avoid "UNEXPECTED key" warnings from loading a vision-only class
+# against a checkpoint that contains both vision + text weights.
+_FULL_MODEL_TYPES: set[str] = {"clip", "siglip", "siglip2"}
+
+# Pure vision models — no text tower, safe to load directly.
+_VISION_ONLY_MAP: dict[str, str] = {
     "dinov2": "Dinov2Model",
 }
 
@@ -26,10 +29,18 @@ def _load_vision_model(model_id: str, dtype: torch.dtype) -> torch.nn.Module:
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     model_type = getattr(config, "model_type", "")
 
-    if model_type in _VISION_CLASS_MAP:
+    # Pure vision architectures — load directly, all keys match.
+    if model_type in _VISION_ONLY_MAP:
         import transformers
-        cls = getattr(transformers, _VISION_CLASS_MAP[model_type])
+        cls = getattr(transformers, _VISION_ONLY_MAP[model_type])
         return cls.from_pretrained(model_id, torch_dtype=dtype)
+
+    # CLIP / SigLIP — load the *full* model (vision+text), then detach
+    # the vision tower.  This way every key in the checkpoint is expected
+    # and the "UNEXPECTED" report is silenced.
+    if model_type in _FULL_MODEL_TYPES:
+        full = AutoModel.from_pretrained(model_id, torch_dtype=dtype)
+        return full.vision_model
 
     # Models with custom code (InternViT, DINOv3, etc.)
     # Try eager attention first to avoid hard flash_attn dependency,
