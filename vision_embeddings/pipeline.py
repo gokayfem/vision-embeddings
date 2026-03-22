@@ -3,7 +3,7 @@
 Three-stage pipeline inspired by pegainfer's kernel-launch amortization:
   Stage 1 (CPU threads) : preprocess next batch of images
   Stage 2 (GPU stream)  : encode current batch
-  Stage 3 (BG thread)   : save + upload previous shard
+  Stage 3 (BG thread)   : save + upload previous shard (batched commit)
 All three stages overlap — the GPU never waits on I/O.
 """
 
@@ -20,9 +20,9 @@ import torch
 from datasets import load_dataset
 from huggingface_hub import HfApi
 from PIL import Image
-from safetensors.torch import save_file
 from tqdm.auto import tqdm
 
+from .batch_upload import upload_config_and_readme, upload_shard_batched
 from .config import DatasetConfig, EncoderConfig
 from .encoders.base import BaseEncoder
 
@@ -34,11 +34,7 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 
 class _BackgroundUploader:
-    """Saves shards to disk and uploads to HF in a background thread.
-
-    Modelled after pegainfer's zero-allocation-during-hot-path pattern:
-    the main loop just submits work and moves on immediately.
-    """
+    """Saves + uploads shards in a background thread using batched commits."""
 
     def __init__(
         self,
@@ -60,15 +56,21 @@ class _BackgroundUploader:
         shard_idx: int,
         output_dir: Path,
     ) -> None:
-        """Submit a shard for background save+upload. Blocks only if the
-        *previous* upload hasn't finished yet (back-pressure)."""
+        """Submit a shard for background save+upload. Back-pressure: blocks
+        only if the previous upload hasn't finished yet."""
         self.wait()
         self._pending = self._pool.submit(
-            self._save_and_upload, tensors, metadata, shard_idx, output_dir,
+            upload_shard_batched,
+            self._api,
+            self._repo_id,
+            tensors,
+            metadata,
+            shard_idx,
+            output_dir,
+            self._delete,
         )
 
     def wait(self) -> None:
-        """Block until the current upload finishes (if any)."""
         with self._lock:
             if self._pending is not None:
                 self._pending.result()
@@ -77,32 +79,6 @@ class _BackgroundUploader:
     def shutdown(self) -> None:
         self.wait()
         self._pool.shutdown(wait=True)
-
-    def _save_and_upload(
-        self,
-        tensors: dict[str, torch.Tensor],
-        metadata: list[dict],
-        shard_idx: int,
-        output_dir: Path,
-    ) -> None:
-        shard_dir = output_dir / "shards"
-        shard_dir.mkdir(parents=True, exist_ok=True)
-        name = f"shard_{shard_idx:06d}"
-        t_path = shard_dir / f"{name}.safetensors"
-        m_path = shard_dir / f"{name}.json"
-
-        save_file(tensors, str(t_path))
-        m_path.write_text(json.dumps(metadata))
-
-        for path in (t_path, m_path):
-            self._api.upload_file(
-                path_or_fileobj=str(path),
-                path_in_repo=f"shards/{path.name}",
-                repo_id=self._repo_id,
-                repo_type="dataset",
-            )
-            if self._delete:
-                path.unlink(missing_ok=True)
 
 
 # ------------------------------------------------------------------
@@ -121,7 +97,6 @@ def _prepare_images_parallel(
     images: list[Image.Image],
     pool: ThreadPoolExecutor,
 ) -> list[Image.Image | None]:
-    """Validate + convert images across multiple CPU threads."""
     return list(pool.map(_prepare_image, images))
 
 
@@ -240,7 +215,7 @@ def process_dataset(
     Three-stage pipeline:
       1. CPU thread-pool preprocesses images in parallel
       2. GPU encodes via dedicated CUDA stream
-      3. Background thread saves + uploads shards (never blocks GPU)
+      3. Background thread saves + uploads shards via batched commits
 
     Resume-safe: detects existing shards in *repo_id* and skips ahead.
     """
@@ -284,7 +259,6 @@ def process_dataset(
             except Exception:
                 continue
 
-            # parallel validation + RGB conversion
             prepared = _prepare_images_parallel(raw_images, prep_pool)
 
             for img_idx, image in enumerate(prepared):
@@ -303,7 +277,6 @@ def process_dataset(
                 })
                 global_idx += 1
 
-                # --- encode full batch ---
                 if len(img_buf) >= batch_size:
                     embs, metas = _encode_safe(encoder, img_buf, meta_buf)
                     ok = embs.shape[0] if embs is not None else 0
@@ -315,7 +288,6 @@ def process_dataset(
                         im.close()
                     img_buf, meta_buf = [], []
 
-                    # --- flush full shards (non-blocking upload) ---
                     while shard_embs:
                         total = sum(e.shape[0] for e in shard_embs)
                         if total < shard_size:
@@ -349,7 +321,6 @@ def process_dataset(
             if max_images and (global_idx - skip_count) >= max_images:
                 break
 
-        # drain remaining buffer
         if img_buf:
             embs, metas = _encode_safe(encoder, img_buf, meta_buf)
             ok = embs.shape[0] if embs is not None else 0
@@ -360,7 +331,6 @@ def process_dataset(
             for im in img_buf:
                 im.close()
 
-        # flush final partial shard
         if shard_embs:
             all_emb = torch.cat(shard_embs, dim=0)
             shard_tensors = _build_shard_tensors(all_emb, save_mode)
@@ -369,13 +339,11 @@ def process_dataset(
             del all_emb
 
     finally:
-        # wait for the last background upload before writing config
         uploader.shutdown()
         prep_pool.shutdown(wait=False)
 
     pbar.close()
 
-    # upload config + README
     config_data = {
         "encoder": encoder.model_id,
         "dataset": dataset_config.hf_id,
@@ -392,13 +360,7 @@ def process_dataset(
     cfg_path.write_text(json.dumps(config_data, indent=2))
     readme = out / "README.md"
     readme.write_text(_generate_readme(encoder.model_id, dataset_name, config_data))
-    for p, dest in [(cfg_path, "config.json"), (readme, "README.md")]:
-        api.upload_file(
-            path_or_fileobj=str(p), path_in_repo=dest,
-            repo_id=repo_id, repo_type="dataset",
-        )
-        if delete_local:
-            p.unlink(missing_ok=True)
+    upload_config_and_readme(api, repo_id, cfg_path, readme, delete_local)
 
     elapsed = time.time() - t0
     print(f"Done: {dataset_name} -> {repo_id}  "

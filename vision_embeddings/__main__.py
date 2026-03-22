@@ -6,6 +6,7 @@ import argparse
 
 import torch
 
+from .auto_batch import find_optimal_batch_size
 from .datasets import CAULDRON_SUBSETS, get_dataset, list_datasets
 from .encoders import create_encoder, get_encoder_config, list_encoders
 from .pipeline import process_dataset
@@ -25,7 +26,10 @@ def main() -> None:
         help="Comma-separated names, or: all | cauldron_all | standard",
     )
     parser.add_argument("--hf-org", type=str, required=True)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--batch-size", type=int, default=0,
+        help="Images per batch (0 = auto-detect max that fits VRAM)",
+    )
     parser.add_argument("--shard-size", type=int, default=1000)
     parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument(
@@ -54,8 +58,8 @@ def main() -> None:
             print(f"  {name:25s}  {c.model_id}  [{c.loader}]")
         return
 
-    if args.shard_size <= 0 or args.batch_size <= 0:
-        parser.error("--shard-size and --batch-size must be positive")
+    if args.shard_size <= 0:
+        parser.error("--shard-size must be positive")
 
     standard = [
         "textvqa", "gqa", "a_okvqa", "vqav2",
@@ -73,17 +77,25 @@ def main() -> None:
     dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
     enc_config = get_encoder_config(args.encoder)
 
-    print(f"Encoder  : {enc_config.model_id}  [{enc_config.loader}]")
-    print(f"Datasets : {len(ds_names)}")
-    print(f"Save mode: {args.save_mode}")
-    print(f"Upload   : {args.hf_org}/<encoder>--<dataset>\n")
-
     encoder = create_encoder(
         args.encoder,
         device=args.device,
         dtype=dtype,
         compile_model=not args.no_compile,
     )
+
+    batch_size = args.batch_size
+    if batch_size <= 0:
+        print("Auto-detecting optimal batch size...")
+        batch_size = find_optimal_batch_size(
+            encoder, resolution=enc_config.resolution,
+        )
+
+    print(f"Encoder   : {enc_config.model_id}  [{enc_config.loader}]")
+    print(f"Batch size: {batch_size}")
+    print(f"Datasets  : {len(ds_names)}")
+    print(f"Save mode : {args.save_mode}")
+    print(f"Upload    : {args.hf_org}/<encoder>--<dataset>\n")
 
     for ds_name in ds_names:
         ds_config = get_dataset(ds_name)
@@ -97,7 +109,7 @@ def main() -> None:
                 repo_id=repo_id,
                 output_dir=args.output_dir,
                 shard_size=args.shard_size,
-                batch_size=args.batch_size,
+                batch_size=batch_size,
                 max_images=args.max_images,
                 save_mode=args.save_mode,
                 hf_token=args.hf_token,

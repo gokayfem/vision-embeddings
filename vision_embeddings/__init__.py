@@ -5,6 +5,7 @@
 >>> process_dataset(encoder, get_dataset("textvqa"), ...)
 """
 
+from .auto_batch import find_optimal_batch_size
 from .config import DatasetConfig, EncoderConfig
 from .datasets import CAULDRON_SUBSETS, get_dataset, list_datasets, register_dataset
 from .encoders import (
@@ -35,4 +36,5 @@ __all__ = [
     "get_dataset",
     "list_datasets",
     "process_dataset",
+    "find_optimal_batch_size",
 ]
