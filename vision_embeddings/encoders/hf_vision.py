@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from PIL import Image
@@ -32,9 +31,19 @@ def _load_vision_model(model_id: str, dtype: torch.dtype) -> torch.nn.Module:
         cls = getattr(transformers, _VISION_CLASS_MAP[model_type])
         return cls.from_pretrained(model_id, torch_dtype=dtype)
 
-    full = AutoModel.from_pretrained(
-        model_id, torch_dtype=dtype, trust_remote_code=True,
-    )
+    # Models with custom code (InternViT, DINOv3, etc.)
+    # Try eager attention first to avoid hard flash_attn dependency,
+    # then fall back to default if the model doesn't support attn_implementation.
+    try:
+        full = AutoModel.from_pretrained(
+            model_id, torch_dtype=dtype, trust_remote_code=True,
+            attn_implementation="eager",
+        )
+    except (TypeError, ValueError):
+        full = AutoModel.from_pretrained(
+            model_id, torch_dtype=dtype, trust_remote_code=True,
+        )
+
     return full.vision_model if hasattr(full, "vision_model") else full
 
 
@@ -45,7 +54,6 @@ class HFVisionEncoder(BaseEncoder):
     - Dedicated CUDA stream for async H2D transfers
     - Non-blocking device copies
     - Pinned CPU output buffer
-    - Threaded image preprocessing
     """
 
     def __init__(
@@ -63,7 +71,9 @@ class HFVisionEncoder(BaseEncoder):
         self.device = device
         self.dtype = dtype
 
-        self.processor = AutoImageProcessor.from_pretrained(config.model_id)
+        self.processor = AutoImageProcessor.from_pretrained(
+            config.model_id, trust_remote_code=True,
+        )
         self.model = _load_vision_model(config.model_id, dtype)
         self.model = self.model.to(device).eval()
 
