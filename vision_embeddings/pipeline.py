@@ -1,11 +1,20 @@
-"""Streaming extraction pipeline: dataset -> encoder -> shards -> HF Hub."""
+"""Pipelined extraction: dataset -> encoder -> shards -> HF Hub.
+
+Three-stage pipeline inspired by pegainfer's kernel-launch amortization:
+  Stage 1 (CPU threads) : preprocess next batch of images
+  Stage 2 (GPU stream)  : encode current batch
+  Stage 3 (BG thread)   : save + upload previous shard
+All three stages overlap — the GPU never waits on I/O.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 
 import torch
 from datasets import load_dataset
@@ -21,7 +30,103 @@ logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------
-# Internal helpers
+# Background uploader — never block the GPU on network I/O
+# ------------------------------------------------------------------
+
+class _BackgroundUploader:
+    """Saves shards to disk and uploads to HF in a background thread.
+
+    Modelled after pegainfer's zero-allocation-during-hot-path pattern:
+    the main loop just submits work and moves on immediately.
+    """
+
+    def __init__(
+        self,
+        api: HfApi,
+        repo_id: str,
+        delete_local: bool = True,
+    ) -> None:
+        self._api = api
+        self._repo_id = repo_id
+        self._delete = delete_local
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="upload")
+        self._pending: Future | None = None
+        self._lock = Lock()
+
+    def submit(
+        self,
+        tensors: dict[str, torch.Tensor],
+        metadata: list[dict],
+        shard_idx: int,
+        output_dir: Path,
+    ) -> None:
+        """Submit a shard for background save+upload. Blocks only if the
+        *previous* upload hasn't finished yet (back-pressure)."""
+        self.wait()
+        self._pending = self._pool.submit(
+            self._save_and_upload, tensors, metadata, shard_idx, output_dir,
+        )
+
+    def wait(self) -> None:
+        """Block until the current upload finishes (if any)."""
+        with self._lock:
+            if self._pending is not None:
+                self._pending.result()
+                self._pending = None
+
+    def shutdown(self) -> None:
+        self.wait()
+        self._pool.shutdown(wait=True)
+
+    def _save_and_upload(
+        self,
+        tensors: dict[str, torch.Tensor],
+        metadata: list[dict],
+        shard_idx: int,
+        output_dir: Path,
+    ) -> None:
+        shard_dir = output_dir / "shards"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        name = f"shard_{shard_idx:06d}"
+        t_path = shard_dir / f"{name}.safetensors"
+        m_path = shard_dir / f"{name}.json"
+
+        save_file(tensors, str(t_path))
+        m_path.write_text(json.dumps(metadata))
+
+        for path in (t_path, m_path):
+            self._api.upload_file(
+                path_or_fileobj=str(path),
+                path_in_repo=f"shards/{path.name}",
+                repo_id=self._repo_id,
+                repo_type="dataset",
+            )
+            if self._delete:
+                path.unlink(missing_ok=True)
+
+
+# ------------------------------------------------------------------
+# Parallel image preprocessing
+# ------------------------------------------------------------------
+
+def _prepare_image(img: Image.Image) -> Image.Image | None:
+    try:
+        rgb = img.convert("RGB")
+        return rgb if min(rgb.size) >= 10 else None
+    except Exception:
+        return None
+
+
+def _prepare_images_parallel(
+    images: list[Image.Image],
+    pool: ThreadPoolExecutor,
+) -> list[Image.Image | None]:
+    """Validate + convert images across multiple CPU threads."""
+    return list(pool.map(_prepare_image, images))
+
+
+# ------------------------------------------------------------------
+# Helpers
 # ------------------------------------------------------------------
 
 def _extract_images(sample: dict, config: DatasetConfig) -> list[Image.Image]:
@@ -30,14 +135,6 @@ def _extract_images(sample: dict, config: DatasetConfig) -> list[Image.Image]:
         return [img for img in raw if img is not None]
     img = sample.get(config.image_column)
     return [img] if img is not None else []
-
-
-def _prepare_image(img: Image.Image) -> Image.Image | None:
-    try:
-        rgb = img.convert("RGB")
-        return rgb if min(rgb.size) >= 10 else None
-    except Exception:
-        return None
 
 
 def _encode_safe(
@@ -79,61 +176,19 @@ def _existing_shard_count(api: HfApi, repo_id: str) -> int:
         return 0
 
 
-def _save_shard(
-    tensors: dict[str, torch.Tensor],
-    metadata: list[dict],
-    shard_idx: int,
-    output_dir: Path,
-) -> tuple[Path, Path]:
-    shard_dir = output_dir / "shards"
-    shard_dir.mkdir(parents=True, exist_ok=True)
-    name = f"shard_{shard_idx:06d}"
-    t_path = shard_dir / f"{name}.safetensors"
-    m_path = shard_dir / f"{name}.json"
-    save_file(tensors, str(t_path))
-    m_path.write_text(json.dumps(metadata))
-    return t_path, m_path
-
-
-def _upload_files(
-    api: HfApi, repo_id: str, paths: list[Path],
-    prefix: str = "shards", delete_local: bool = True,
-) -> None:
-    for path in paths:
-        api.upload_file(
-            path_or_fileobj=str(path),
-            path_in_repo=f"{prefix}/{path.name}",
-            repo_id=repo_id, repo_type="dataset",
-        )
-        if delete_local:
-            path.unlink(missing_ok=True)
-
-
-def _flush_shard(
-    all_emb: torch.Tensor,
-    all_meta: list[dict],
-    shard_idx: int,
-    count: int,
+def _build_shard_tensors(
+    emb: torch.Tensor,
     save_mode: str,
-    out: Path,
-    api: HfApi,
-    repo_id: str,
-    delete_local: bool,
-) -> None:
-    chunk = all_emb[:count]
-    meta = all_meta[:count]
-
+) -> dict[str, torch.Tensor]:
     tensors: dict[str, torch.Tensor] = {}
     if save_mode == "pooled":
-        tensors["embeddings"] = chunk.mean(dim=1) if chunk.ndim == 3 else chunk
+        tensors["embeddings"] = emb.mean(dim=1) if emb.ndim == 3 else emb
     elif save_mode == "both":
-        tensors["embeddings"] = chunk
-        tensors["pooled"] = chunk.mean(dim=1) if chunk.ndim == 3 else chunk
+        tensors["embeddings"] = emb
+        tensors["pooled"] = emb.mean(dim=1) if emb.ndim == 3 else emb
     else:
-        tensors["embeddings"] = chunk
-
-    t_path, m_path = _save_shard(tensors, meta, shard_idx, out)
-    _upload_files(api, repo_id, [t_path, m_path], delete_local=delete_local)
+        tensors["embeddings"] = emb
+    return tensors
 
 
 def _generate_readme(encoder_id: str, name: str, cfg: dict) -> str:
@@ -178,8 +233,14 @@ def process_dataset(
     save_mode: str = "tokens",
     hf_token: str | None = None,
     delete_local: bool = True,
+    num_prep_workers: int = 4,
 ) -> None:
     """Stream a dataset, encode images, shard, and upload to HF Hub.
+
+    Three-stage pipeline:
+      1. CPU thread-pool preprocesses images in parallel
+      2. GPU encodes via dedicated CUDA stream
+      3. Background thread saves + uploads shards (never blocks GPU)
 
     Resume-safe: detects existing shards in *repo_id* and skips ahead.
     """
@@ -202,6 +263,11 @@ def process_dataset(
     out = Path(output_dir) / dataset_name
     out.mkdir(parents=True, exist_ok=True)
 
+    uploader = _BackgroundUploader(api, repo_id, delete_local)
+    prep_pool = ThreadPoolExecutor(
+        max_workers=num_prep_workers, thread_name_prefix="prep",
+    )
+
     shard_idx = existing
     img_buf: list[Image.Image] = []
     meta_buf: list[dict] = []
@@ -211,90 +277,105 @@ def process_dataset(
     t0 = time.time()
     pbar = tqdm(desc=f"{dataset_name} [shard {shard_idx}]", unit="img")
 
-    for sample_idx, sample in enumerate(ds):
-        try:
-            images = _extract_images(sample, dataset_config)
-        except Exception:
-            continue
-
-        for img_idx, raw in enumerate(images):
-            if global_idx < skip_count:
-                global_idx += 1
+    try:
+        for sample_idx, sample in enumerate(ds):
+            try:
+                raw_images = _extract_images(sample, dataset_config)
+            except Exception:
                 continue
 
-            image = _prepare_image(raw)
-            if image is None:
+            # parallel validation + RGB conversion
+            prepared = _prepare_images_parallel(raw_images, prep_pool)
+
+            for img_idx, image in enumerate(prepared):
+                if global_idx < skip_count:
+                    global_idx += 1
+                    continue
+                if image is None:
+                    global_idx += 1
+                    continue
+
+                img_buf.append(image)
+                meta_buf.append({
+                    "global_idx": global_idx,
+                    "sample_idx": sample_idx,
+                    "image_idx": img_idx,
+                })
                 global_idx += 1
-                continue
 
-            img_buf.append(image)
-            meta_buf.append({
-                "global_idx": global_idx,
-                "sample_idx": sample_idx,
-                "image_idx": img_idx,
-            })
-            global_idx += 1
+                # --- encode full batch ---
+                if len(img_buf) >= batch_size:
+                    embs, metas = _encode_safe(encoder, img_buf, meta_buf)
+                    ok = embs.shape[0] if embs is not None else 0
+                    if embs is not None:
+                        shard_embs.append(embs)
+                        shard_meta.extend(metas)
+                    pbar.update(ok)
+                    for im in img_buf:
+                        im.close()
+                    img_buf, meta_buf = [], []
 
-            if len(img_buf) >= batch_size:
-                embs, metas = _encode_safe(encoder, img_buf, meta_buf)
-                ok = embs.shape[0] if embs is not None else 0
-                if embs is not None:
-                    shard_embs.append(embs)
-                    shard_meta.extend(metas)
-                pbar.update(ok)
-                for im in img_buf:
-                    im.close()
-                img_buf, meta_buf = [], []
+                    # --- flush full shards (non-blocking upload) ---
+                    while shard_embs:
+                        total = sum(e.shape[0] for e in shard_embs)
+                        if total < shard_size:
+                            break
+                        all_emb = torch.cat(shard_embs, dim=0)
+                        shard_tensors = _build_shard_tensors(
+                            all_emb[:shard_size], save_mode,
+                        )
+                        uploader.submit(
+                            shard_tensors,
+                            shard_meta[:shard_size],
+                            shard_idx,
+                            out,
+                        )
+                        left = all_emb.shape[0] - shard_size
+                        if left > 0:
+                            shard_embs = [all_emb[shard_size:].clone()]
+                            shard_meta = shard_meta[shard_size:]
+                        else:
+                            shard_embs, shard_meta = [], []
+                        del all_emb
+                        shard_idx += 1
+                        elapsed = time.time() - t0
+                        speed = (global_idx - skip_count) / max(elapsed, 1)
+                        pbar.set_description(
+                            f"{dataset_name} [shard {shard_idx}] {speed:.0f} img/s"
+                        )
 
-                while shard_embs:
-                    total = sum(e.shape[0] for e in shard_embs)
-                    if total < shard_size:
-                        break
-                    all_emb = torch.cat(shard_embs, dim=0)
-                    _flush_shard(
-                        all_emb, shard_meta, shard_idx, shard_size,
-                        save_mode, out, api, repo_id, delete_local,
-                    )
-                    left = all_emb.shape[0] - shard_size
-                    if left > 0:
-                        shard_embs = [all_emb[shard_size:].clone()]
-                        shard_meta = shard_meta[shard_size:]
-                    else:
-                        shard_embs, shard_meta = [], []
-                    del all_emb
-                    shard_idx += 1
-                    elapsed = time.time() - t0
-                    speed = (global_idx - skip_count) / max(elapsed, 1)
-                    pbar.set_description(
-                        f"{dataset_name} [shard {shard_idx}] {speed:.0f} img/s"
-                    )
-
+                if max_images and (global_idx - skip_count) >= max_images:
+                    break
             if max_images and (global_idx - skip_count) >= max_images:
                 break
-        if max_images and (global_idx - skip_count) >= max_images:
-            break
 
-    if img_buf:
-        embs, metas = _encode_safe(encoder, img_buf, meta_buf)
-        ok = embs.shape[0] if embs is not None else 0
-        if embs is not None:
-            shard_embs.append(embs)
-            shard_meta.extend(metas)
-        pbar.update(ok)
-        for im in img_buf:
-            im.close()
+        # drain remaining buffer
+        if img_buf:
+            embs, metas = _encode_safe(encoder, img_buf, meta_buf)
+            ok = embs.shape[0] if embs is not None else 0
+            if embs is not None:
+                shard_embs.append(embs)
+                shard_meta.extend(metas)
+            pbar.update(ok)
+            for im in img_buf:
+                im.close()
 
-    if shard_embs:
-        all_emb = torch.cat(shard_embs, dim=0)
-        _flush_shard(
-            all_emb, shard_meta, shard_idx, all_emb.shape[0],
-            save_mode, out, api, repo_id, delete_local,
-        )
-        shard_idx += 1
-        del all_emb
+        # flush final partial shard
+        if shard_embs:
+            all_emb = torch.cat(shard_embs, dim=0)
+            shard_tensors = _build_shard_tensors(all_emb, save_mode)
+            uploader.submit(shard_tensors, shard_meta, shard_idx, out)
+            shard_idx += 1
+            del all_emb
+
+    finally:
+        # wait for the last background upload before writing config
+        uploader.shutdown()
+        prep_pool.shutdown(wait=False)
 
     pbar.close()
 
+    # upload config + README
     config_data = {
         "encoder": encoder.model_id,
         "dataset": dataset_config.hf_id,

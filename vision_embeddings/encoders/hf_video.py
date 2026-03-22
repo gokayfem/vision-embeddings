@@ -49,20 +49,53 @@ class HFVideoEncoder(BaseEncoder):
             config.model_id, torch_dtype=dtype,
         ).to(device).eval()
 
+        self._stream = (
+            torch.cuda.Stream(device=device)
+            if device != "cpu" else None
+        )
+
         if compile_model:
             try:
                 self.model = torch.compile(self.model, mode="reduce-overhead")
             except Exception:
                 logger.warning("torch.compile unavailable, continuing without")
 
+    def preprocess(self, images: list[Image.Image]) -> dict[str, torch.Tensor]:
+        """CPU-only: images -> processor output dict (pinned)."""
+        videos = [_image_to_video(img, self._frames) for img in images]
+        inputs = self.processor(videos, return_tensors="pt")
+        if self.device != "cpu":
+            for k in inputs:
+                if torch.is_tensor(inputs[k]):
+                    inputs[k] = inputs[k].pin_memory()
+        return inputs
+
+    @torch.no_grad()
+    def encode_preprocessed(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """GPU: preprocessed inputs -> embeddings on CPU."""
+        stream = self._stream
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                dev_inputs = {
+                    k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
+                    for k, v in inputs.items()
+                }
+                if hasattr(self.model, "get_vision_features"):
+                    tokens = self.model.get_vision_features(**dev_inputs)
+                else:
+                    tokens = self.model(**dev_inputs).last_hidden_state
+            stream.synchronize()
+        else:
+            dev_inputs = {
+                k: v.to(self.device) if torch.is_tensor(v) else v
+                for k, v in inputs.items()
+            }
+            if hasattr(self.model, "get_vision_features"):
+                tokens = self.model.get_vision_features(**dev_inputs)
+            else:
+                tokens = self.model(**dev_inputs).last_hidden_state
+        return tokens.to(torch.float16).cpu()
+
     @torch.no_grad()
     def encode_batch(self, images: list[Image.Image]) -> torch.Tensor:
-        videos = [_image_to_video(img, self._frames) for img in images]
-        inputs = self.processor(videos, return_tensors="pt").to(self.device)
-
-        if hasattr(self.model, "get_vision_features"):
-            tokens = self.model.get_vision_features(**inputs)
-        else:
-            tokens = self.model(**inputs).last_hidden_state
-
-        return tokens.to(torch.float16).cpu()
+        return self.encode_preprocessed(self.preprocess(images))
