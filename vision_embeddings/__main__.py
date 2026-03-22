@@ -43,6 +43,8 @@ def main() -> None:
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--dtype", type=str, default="float16",
                         choices=["float16", "bfloat16"])
+    parser.add_argument("--use-dali", action="store_true",
+                        help="Use NVIDIA DALI for GPU preprocessing (requires nvidia-dali)")
     parser.add_argument("--list-datasets", action="store_true")
     parser.add_argument("--list-encoders", action="store_true")
 
@@ -82,6 +84,7 @@ def main() -> None:
         device=args.device,
         dtype=dtype,
         compile_model=not args.no_compile,
+        use_dali=args.use_dali,
     )
 
     batch_size = args.batch_size

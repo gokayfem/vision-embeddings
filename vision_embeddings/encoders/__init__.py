@@ -56,6 +56,7 @@ def create_encoder(
     device: str = "cuda",
     dtype: torch.dtype = torch.float16,
     compile_model: bool = True,
+    use_dali: bool = False,
 ) -> BaseEncoder:
     """Instantiate an encoder by registry name."""
     config = get_encoder_config(name)
@@ -65,4 +66,8 @@ def create_encoder(
             f"No loader for '{config.loader}'. "
             f"Available: {list(_LOADER_MAP.keys())}"
         )
-    return cls(config, device=device, dtype=dtype, compile_model=compile_model)
+    kwargs: dict = dict(device=device, dtype=dtype, compile_model=compile_model)
+    # Only HFVisionEncoder supports DALI
+    if use_dali and cls is HFVisionEncoder:
+        kwargs["use_dali"] = True
+    return cls(config, **kwargs)

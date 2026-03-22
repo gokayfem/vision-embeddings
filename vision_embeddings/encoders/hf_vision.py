@@ -1,4 +1,10 @@
-"""HuggingFace vision-model encoder (SigLIP2, CLIP, DINOv2, DINOv3, ...)."""
+"""HuggingFace vision-model encoder (SigLIP2, CLIP, DINOv2, DINOv3, ...).
+
+Inspired by production patterns from fal.ai's SigLIP2 endpoint:
+- Explicit warmup to trigger CUDA/JIT/cudnn initialization before real work
+- channels_last memory format for tensor-core efficiency
+- Simple, direct preprocessing path
+"""
 
 from __future__ import annotations
 
@@ -10,6 +16,7 @@ import torch
 from PIL import Image
 
 from ..config import EncoderConfig
+from ..dali_preprocessor import DALIPreprocessor, is_available as _dali_available
 from .base import BaseEncoder
 
 logger = logging.getLogger(__name__)
@@ -134,9 +141,11 @@ class HFVisionEncoder(BaseEncoder):
     """Wraps any HuggingFace ``*VisionModel`` behind :meth:`encode_batch`.
 
     Performance features:
-    - Dedicated CUDA stream for async H2D transfers
-    - Non-blocking device copies
-    - Pinned CPU output buffer
+    - Explicit warmup to trigger CUDA kernels, JIT, and cudnn autotuning
+    - channels_last memory format for tensor-core efficiency
+    - Pinned memory + non-blocking H2D transfers
+    - Optional DALI GPU preprocessing
+    - Optional torch.compile with max-autotune
     """
 
     def __init__(
@@ -145,6 +154,7 @@ class HFVisionEncoder(BaseEncoder):
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
         compile_model: bool = True,
+        use_dali: bool = False,
     ) -> None:
         from transformers import AutoImageProcessor
 
@@ -158,42 +168,66 @@ class HFVisionEncoder(BaseEncoder):
             config.model_id, trust_remote_code=True,
         )
         self.model = _load_vision_model(config.model_id, dtype)
-        self.model = self.model.to(device).eval()
+        self.model = self.model.to(device).to(memory_format=torch.channels_last).eval()
 
-        # dedicated stream for H2D overlap
-        self._stream = (
-            torch.cuda.Stream(device=device)
-            if device != "cpu" else None
-        )
+        # Optional DALI GPU preprocessing
+        self._dali: DALIPreprocessor | None = None
+        if use_dali and _dali_available():
+            proc_mean = getattr(self.processor, "image_mean", (0.485, 0.456, 0.406))
+            proc_std = getattr(self.processor, "image_std", (0.229, 0.224, 0.225))
+            device_id = 0 if device == "cuda" else int(device.split(":")[-1])
+            self._dali = DALIPreprocessor(
+                resize=config.resolution,
+                crop=config.resolution,
+                mean=tuple(proc_mean),
+                std=tuple(proc_std),
+                device_id=device_id,
+            )
+            logger.info("DALI GPU preprocessing enabled (resolution=%d)", config.resolution)
+        elif use_dali:
+            logger.warning("DALI requested but not installed — using CPU preprocessing")
 
         if compile_model:
             try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
+                logger.info("Compiling model (first batch will be slow)...")
+                self.model = torch.compile(self.model, mode="max-autotune")
             except Exception:
                 logger.warning("torch.compile unavailable, continuing without")
 
+        # Warmup: trigger CUDA kernels, JIT compilation, cudnn autotuning
+        self._warmup(config.resolution)
+
+    def _warmup(self, resolution: int) -> None:
+        """Run a dummy batch to trigger all lazy initialization."""
+        logger.info("Warming up encoder...")
+        dummy = [Image.new("RGB", (resolution, resolution))]
+        with torch.inference_mode():
+            self.encode_batch(dummy)
+        if self.device != "cpu":
+            torch.cuda.synchronize()
+        logger.info("Warmup complete")
+
     def preprocess(self, images: list[Image.Image]) -> torch.Tensor:
-        """CPU-only: images -> pixel_values tensor (pinned memory)."""
+        """Images -> pixel_values tensor. Uses DALI (GPU) if available,
+        otherwise falls back to HF AutoImageProcessor (CPU, pinned)."""
+        if self._dali is not None:
+            pv = self._dali(images)
+            if not isinstance(pv, torch.Tensor):
+                pv = torch.as_tensor(pv, device=self.device)
+            return pv.to(memory_format=torch.channels_last)
         inputs = self.processor(images=images, return_tensors="pt")
-        pv = inputs["pixel_values"]
+        pv = inputs["pixel_values"].to(memory_format=torch.channels_last)
         if self.device != "cpu":
             pv = pv.pin_memory()
         return pv
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def encode_preprocessed(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """GPU: preprocessed pixel_values -> embeddings on CPU."""
-        stream = self._stream
-        if stream is not None:
-            with torch.cuda.stream(stream):
-                pv = pixel_values.to(self.device, dtype=self.dtype, non_blocking=True)
-                out = self.model(pixel_values=pv).last_hidden_state
-            stream.synchronize()
-        else:
-            pv = pixel_values.to(self.device, dtype=self.dtype)
-            out = self.model(pixel_values=pv).last_hidden_state
+        pv = pixel_values.to(self.device, dtype=self.dtype, non_blocking=True)
+        out = self.model(pixel_values=pv).last_hidden_state
         return out.to(torch.float16).cpu()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def encode_batch(self, images: list[Image.Image]) -> torch.Tensor:
         return self.encode_preprocessed(self.preprocess(images))

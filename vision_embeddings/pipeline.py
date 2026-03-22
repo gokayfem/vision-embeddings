@@ -112,11 +112,50 @@ def _extract_images(sample: dict, config: DatasetConfig) -> list[Image.Image]:
     return [img] if img is not None else []
 
 
+def _preprocess_safe(
+    encoder: BaseEncoder,
+    images: list[Image.Image],
+) -> object:
+    """CPU-only preprocessing — safe to run in a background thread."""
+    try:
+        return encoder.preprocess(images)
+    except Exception as exc:
+        logger.warning("Batch preprocess failed (%d imgs): %s", len(images), exc)
+        return None
+
+
+def _encode_preprocessed_safe(
+    encoder: BaseEncoder,
+    preprocessed: object,
+    images: list[Image.Image],
+    metadata: list[dict],
+) -> tuple[torch.Tensor | None, list[dict]]:
+    """GPU encoding with per-image fallback on failure."""
+    if preprocessed is not None:
+        try:
+            return encoder.encode_preprocessed(preprocessed), metadata
+        except Exception as exc:
+            logger.warning("Batch encode failed (%d imgs): %s — per-image fallback",
+                           len(images), exc)
+    # Fallback: re-encode each image individually
+    embs, metas = [], []
+    for img, meta in zip(images, metadata):
+        try:
+            embs.append(encoder.encode_batch([img]))
+            metas.append(meta)
+        except Exception:
+            continue
+    if embs:
+        return torch.cat(embs, dim=0), metas
+    return None, []
+
+
 def _encode_safe(
     encoder: BaseEncoder,
     images: list[Image.Image],
     metadata: list[dict],
 ) -> tuple[torch.Tensor | None, list[dict]]:
+    """Synchronous encode (used for drain / fallback)."""
     try:
         return encoder.encode_batch(images), metadata
     except Exception as exc:
@@ -221,6 +260,8 @@ def process_dataset(
     """
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
 
     api = HfApi(token=hf_token)
     api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
@@ -242,15 +283,87 @@ def process_dataset(
     prep_pool = ThreadPoolExecutor(
         max_workers=num_prep_workers, thread_name_prefix="prep",
     )
+    # Single-thread pool for CPU preprocessing — overlaps with GPU encode
+    prefetch_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch")
 
     shard_idx = existing
     img_buf: list[Image.Image] = []
     meta_buf: list[dict] = []
-    shard_embs: list[torch.Tensor] = []
+    # Pre-allocated shard buffer — avoids O(N^2) torch.cat on growing lists
+    shard_buf: torch.Tensor | None = None
+    shard_fill = 0
     shard_meta: list[dict] = []
     global_idx = 0
     t0 = time.time()
     pbar = tqdm(desc=f"{dataset_name} [shard {shard_idx}]", unit="img")
+
+    # Double-buffer state: previous batch being preprocessed on CPU
+    prefetch_future: Future | None = None
+    prefetch_images: list[Image.Image] = []
+    prefetch_meta: list[dict] = []
+
+    def _flush_shard_buf() -> None:
+        """Emit complete shards from the buffer."""
+        nonlocal shard_buf, shard_fill, shard_meta, shard_idx
+        while shard_buf is not None and shard_fill >= shard_size:
+            # Clone the shard slice so the bg uploader owns the memory
+            emit_emb = shard_buf[:shard_size].clone()
+            shard_tensors = _build_shard_tensors(emit_emb, save_mode)
+            uploader.submit(
+                shard_tensors,
+                shard_meta[:shard_size],
+                shard_idx,
+                out,
+            )
+            # Shift remainder to front of buffer (no reallocation)
+            leftover = shard_fill - shard_size
+            if leftover > 0:
+                shard_buf[:leftover] = shard_buf[shard_size:shard_fill]
+            shard_fill = leftover
+            shard_meta = shard_meta[shard_size:]
+            shard_idx += 1
+            elapsed = time.time() - t0
+            speed = (global_idx - skip_count) / max(elapsed, 1)
+            pbar.set_description(
+                f"{dataset_name} [shard {shard_idx}] {speed:.0f} img/s"
+            )
+
+    def _accumulate(embs: torch.Tensor, metas: list[dict]) -> None:
+        """Copy batch embeddings into the pre-allocated shard buffer."""
+        nonlocal shard_buf, shard_fill, shard_meta
+        n = embs.shape[0]
+        if shard_buf is None:
+            buf_cap = shard_size + batch_size
+            shard_buf = torch.empty((buf_cap,) + embs.shape[1:], dtype=embs.dtype)
+        # Grow buffer if needed (rare — only if batch_size changed)
+        if shard_fill + n > shard_buf.shape[0]:
+            new_buf = torch.empty(
+                (shard_fill + n + batch_size,) + embs.shape[1:], dtype=embs.dtype,
+            )
+            new_buf[:shard_fill] = shard_buf[:shard_fill]
+            shard_buf = new_buf
+        shard_buf[shard_fill : shard_fill + n] = embs
+        shard_fill += n
+        shard_meta.extend(metas)
+
+    def _drain_prefetch() -> None:
+        """Encode the in-flight prefetch batch (GPU) and accumulate."""
+        nonlocal prefetch_future, prefetch_images, prefetch_meta
+        if prefetch_future is None:
+            return
+        preprocessed = prefetch_future.result()
+        embs, metas = _encode_preprocessed_safe(
+            encoder, preprocessed, prefetch_images, prefetch_meta,
+        )
+        ok = embs.shape[0] if embs is not None else 0
+        if embs is not None:
+            _accumulate(embs, metas)
+        pbar.update(ok)
+        for im in prefetch_images:
+            im.close()
+        prefetch_future = None
+        prefetch_images = []
+        prefetch_meta = []
 
     try:
         for sample_idx, sample in enumerate(ds):
@@ -278,68 +391,48 @@ def process_dataset(
                 global_idx += 1
 
                 if len(img_buf) >= batch_size:
-                    embs, metas = _encode_safe(encoder, img_buf, meta_buf)
-                    ok = embs.shape[0] if embs is not None else 0
-                    if embs is not None:
-                        shard_embs.append(embs)
-                        shard_meta.extend(metas)
-                    pbar.update(ok)
-                    for im in img_buf:
-                        im.close()
-                    img_buf, meta_buf = [], []
+                    # 1) Encode the previous prefetched batch on GPU
+                    #    (while this batch was being collected)
+                    _drain_prefetch()
+                    _flush_shard_buf()
 
-                    while shard_embs:
-                        total = sum(e.shape[0] for e in shard_embs)
-                        if total < shard_size:
-                            break
-                        all_emb = torch.cat(shard_embs, dim=0)
-                        shard_tensors = _build_shard_tensors(
-                            all_emb[:shard_size], save_mode,
-                        )
-                        uploader.submit(
-                            shard_tensors,
-                            shard_meta[:shard_size],
-                            shard_idx,
-                            out,
-                        )
-                        left = all_emb.shape[0] - shard_size
-                        if left > 0:
-                            shard_embs = [all_emb[shard_size:].clone()]
-                            shard_meta = shard_meta[shard_size:]
-                        else:
-                            shard_embs, shard_meta = [], []
-                        del all_emb
-                        shard_idx += 1
-                        elapsed = time.time() - t0
-                        speed = (global_idx - skip_count) / max(elapsed, 1)
-                        pbar.set_description(
-                            f"{dataset_name} [shard {shard_idx}] {speed:.0f} img/s"
-                        )
+                    # 2) Submit current batch for CPU preprocessing
+                    #    (overlaps with GPU work on next drain)
+                    prefetch_future = prefetch_pool.submit(
+                        _preprocess_safe, encoder, img_buf,
+                    )
+                    prefetch_images = img_buf
+                    prefetch_meta = meta_buf
+                    img_buf, meta_buf = [], []
 
                 if max_images and (global_idx - skip_count) >= max_images:
                     break
             if max_images and (global_idx - skip_count) >= max_images:
                 break
 
+        # Drain the in-flight prefetch batch
+        _drain_prefetch()
+
+        # Drain remaining images that didn't fill a full batch
         if img_buf:
             embs, metas = _encode_safe(encoder, img_buf, meta_buf)
             ok = embs.shape[0] if embs is not None else 0
             if embs is not None:
-                shard_embs.append(embs)
-                shard_meta.extend(metas)
+                _accumulate(embs, metas)
             pbar.update(ok)
             for im in img_buf:
                 im.close()
 
-        if shard_embs:
-            all_emb = torch.cat(shard_embs, dim=0)
-            shard_tensors = _build_shard_tensors(all_emb, save_mode)
+        # Flush any partial shard
+        if shard_fill > 0 and shard_buf is not None:
+            emit_emb = shard_buf[:shard_fill].clone()
+            shard_tensors = _build_shard_tensors(emit_emb, save_mode)
             uploader.submit(shard_tensors, shard_meta, shard_idx, out)
             shard_idx += 1
-            del all_emb
 
     finally:
         uploader.shutdown()
+        prefetch_pool.shutdown(wait=False)
         prep_pool.shutdown(wait=False)
 
     pbar.close()

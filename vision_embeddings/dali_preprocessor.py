@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -33,6 +34,10 @@ class DALIPreprocessor:
 
     Replaces the CPU-bound ``AutoImageProcessor`` for HF vision encoders.
     All work happens on GPU — the output is a CUDA tensor ready for the model.
+
+    The DALI pipeline is built once at a fixed max batch size and reused
+    across calls. Smaller batches are padded with dummy images and the
+    output is sliced.
     """
 
     def __init__(
@@ -41,6 +46,7 @@ class DALIPreprocessor:
         crop: int = 384,
         mean: tuple[float, ...] = (0.485, 0.456, 0.406),
         std: tuple[float, ...] = (0.229, 0.224, 0.225),
+        max_batch_size: int = 64,
         device_id: int = 0,
     ) -> None:
         if not _DALI_AVAILABLE:
@@ -53,6 +59,47 @@ class DALIPreprocessor:
         self.mean = mean
         self.std = std
         self.device_id = device_id
+        self._max_batch_size = max_batch_size
+
+        # Build the pipeline once with the max batch size
+        self._pipe = self._build_pipeline(max_batch_size)
+        # Dummy image for padding short batches
+        self._dummy = np.zeros((10, 10, 3), dtype=np.uint8)
+
+    def _build_pipeline(self, batch_size: int):
+        resize = self.resize
+        crop = self.crop
+        mean = self.mean
+        std = self.std
+        device_id = self.device_id
+
+        @pipeline_def(batch_size=batch_size, num_threads=4, device_id=device_id)
+        def _pipe():
+            raw = fn.external_source(name="images", device="cpu")
+            gpu = raw.gpu()
+            resized = fn.resize(
+                gpu,
+                resize_shorter=resize,
+                interp_type=types.INTERP_TRIANGULAR,
+            )
+            cropped = fn.crop(
+                resized,
+                crop=(crop, crop),
+                crop_pos_x=0.5,
+                crop_pos_y=0.5,
+            )
+            normalized = fn.crop_mirror_normalize(
+                cropped,
+                mean=[m * 255.0 for m in mean],
+                std=[s * 255.0 for s in std],
+                dtype=types.FLOAT,
+                output_layout="CHW",
+            )
+            return normalized
+
+        pipe = _pipe()
+        pipe.build()
+        return pipe
 
     def __call__(
         self,
@@ -62,37 +109,21 @@ class DALIPreprocessor:
 
         Returns ``[batch, 3, crop, crop]`` float32 CUDA tensor, normalized.
         """
-        import numpy as np
-
+        real_count = len(images)
         arrays = [np.asarray(img.convert("RGB"), dtype=np.uint8) for img in images]
 
-        @pipeline_def(batch_size=len(arrays), num_threads=4, device_id=self.device_id)
-        def _pipe():
-            raw = fn.external_source(name="images", device="cpu")
-            gpu = raw.gpu()
-            resized = fn.resize(
-                gpu,
-                resize_shorter=self.resize,
-                interp_type=types.INTERP_TRIANGULAR,
-            )
-            cropped = fn.crop(
-                resized,
-                crop=(self.crop, self.crop),
-                crop_pos_x=0.5,
-                crop_pos_y=0.5,
-            )
-            normalized = fn.crop_mirror_normalize(
-                cropped,
-                mean=[m * 255.0 for m in self.mean],
-                std=[s * 255.0 for s in self.std],
-                dtype=types.FLOAT,
-                output_layout="CHW",
-            )
-            return normalized
+        # Rebuild pipeline if batch exceeds max (rare)
+        if real_count > self._max_batch_size:
+            logger.info("DALI: rebuilding pipeline for batch_size=%d", real_count)
+            self._pipe = self._build_pipeline(real_count)
+            self._max_batch_size = real_count
 
-        pipe = _pipe()
-        pipe.build()
-        pipe.feed_input("images", arrays)
-        (out,) = pipe.run()
+        # Pad to max_batch_size with dummy images
+        while len(arrays) < self._max_batch_size:
+            arrays.append(self._dummy)
 
-        return out.as_tensor()  # [batch, 3, crop, crop] on GPU
+        self._pipe.feed_input("images", arrays)
+        (out,) = self._pipe.run()
+
+        tensor = out.as_tensor()  # [max_batch_size, 3, crop, crop] on GPU
+        return tensor[:real_count]  # slice to actual batch size
