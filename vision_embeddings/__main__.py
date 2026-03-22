@@ -40,7 +40,8 @@ def main() -> None:
     parser.add_argument("--hf-token", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="/tmp/embedding_cache")
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable torch.compile (off by default)")
     parser.add_argument("--dtype", type=str, default="float16",
                         choices=["float16", "bfloat16"])
     parser.add_argument("--use-dali", action="store_true",
@@ -83,7 +84,7 @@ def main() -> None:
         args.encoder,
         device=args.device,
         dtype=dtype,
-        compile_model=not args.no_compile,
+        compile_model=args.compile,
         use_dali=args.use_dali,
     )
 

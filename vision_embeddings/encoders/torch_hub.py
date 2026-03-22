@@ -84,7 +84,7 @@ class TorchHubEncoder(BaseEncoder):
         if compile_model:
             try:
                 logger.info("Compiling model (first batch will be slow)...")
-                self.model = torch.compile(self.model, mode="max-autotune")
+                self.model = torch.compile(self.model)
             except Exception:
                 logger.warning("torch.compile unavailable, continuing without")
 

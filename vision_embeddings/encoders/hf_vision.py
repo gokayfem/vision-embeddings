@@ -190,11 +190,11 @@ class HFVisionEncoder(BaseEncoder):
         if compile_model:
             try:
                 logger.info("Compiling model (first batch will be slow)...")
-                self.model = torch.compile(self.model, mode="max-autotune")
+                self.model = torch.compile(self.model)
             except Exception:
                 logger.warning("torch.compile unavailable, continuing without")
 
-        # Warmup: trigger CUDA kernels, JIT compilation, cudnn autotuning
+        # Warmup: trigger CUDA kernels, cudnn autotuning
         self._warmup(config.resolution)
 
     def _warmup(self, resolution: int) -> None:

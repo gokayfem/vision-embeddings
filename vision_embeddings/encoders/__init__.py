@@ -55,7 +55,7 @@ def create_encoder(
     *,
     device: str = "cuda",
     dtype: torch.dtype = torch.float16,
-    compile_model: bool = True,
+    compile_model: bool = False,
     use_dali: bool = False,
 ) -> BaseEncoder:
     """Instantiate an encoder by registry name."""
