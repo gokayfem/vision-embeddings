@@ -84,17 +84,17 @@ def _load_vision_model(model_id: str, dtype: torch.dtype) -> torch.nn.Module:
 
     # Models with custom code (InternViT, DINOv3, etc.)
     # Ensure flash_attn is importable so custom modeling files don't crash.
+    # The model's own code detects flash_attn is missing and falls back to
+    # standard attention — we do NOT pass attn_implementation here because
+    # custom model code often doesn't handle that kwarg.
     _ensure_flash_attn_importable()
 
-    try:
-        full = AutoModel.from_pretrained(
-            model_id, torch_dtype=dtype, trust_remote_code=True,
-            attn_implementation="eager",
-        )
-    except (TypeError, ValueError):
-        full = AutoModel.from_pretrained(
-            model_id, torch_dtype=dtype, trust_remote_code=True,
-        )
+    full = AutoModel.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+        device_map=None,
+    )
 
     return full.vision_model if hasattr(full, "vision_model") else full
 
