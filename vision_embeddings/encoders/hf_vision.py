@@ -84,20 +84,50 @@ def _load_vision_model(model_id: str, dtype: torch.dtype) -> torch.nn.Module:
 
     # Models with custom code (InternViT, DINOv3, etc.)
     # Ensure flash_attn is importable so custom modeling files don't crash.
-    # The model's own code detects flash_attn is missing and falls back to
-    # standard attention — we do NOT pass attn_implementation here because
-    # custom model code often doesn't handle that kwarg.
     _ensure_flash_attn_importable()
 
-    full = AutoModel.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-        device_map=None,
-        low_cpu_mem_usage=False,
-    )
+    try:
+        full = AutoModel.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            device_map=None,
+            low_cpu_mem_usage=False,
+        )
+    except RuntimeError as exc:
+        if "meta tensor" not in str(exc).lower():
+            raise
+        # Fallback: construct model from config on CPU, load state dict manually.
+        logger.info("Meta-tensor error — falling back to manual weight loading")
+        full = _load_custom_model_manual(model_id, dtype)
 
     return full.vision_model if hasattr(full, "vision_model") else full
+
+
+def _load_custom_model_manual(model_id: str, dtype: torch.dtype) -> torch.nn.Module:
+    """Last-resort loader for custom models that break with lazy init."""
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file as load_safetensors
+    from transformers import AutoConfig, AutoModel
+
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+
+    # Instantiate with real CPU tensors — no meta device.
+    with torch.device("cpu"):
+        model = AutoModel.from_config(
+            config, trust_remote_code=True, torch_dtype=dtype,
+        )
+
+    # Load weights from safetensors (preferred) or pytorch bin.
+    try:
+        weight_path = hf_hub_download(model_id, "model.safetensors")
+        state_dict = load_safetensors(weight_path)
+    except Exception:
+        weight_path = hf_hub_download(model_id, "pytorch_model.bin")
+        state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)
+
+    model.load_state_dict(state_dict, strict=False)
+    return model.to(dtype=dtype)
 
 
 class HFVisionEncoder(BaseEncoder):
